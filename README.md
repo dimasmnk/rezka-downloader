@@ -54,7 +54,15 @@ A cross-platform desktop application for downloading films and series from HDRez
 
 Download a prebuilt binary from the [Releases](../../releases) page for your platform.
 
-**macOS / Linux:** make the binary executable if needed:
+**macOS note:** If you see *"App is damaged and can't be opened"*, this is because the app is not notarized by Apple. To fix this, run the following command in Terminal:
+
+```bash
+xattr -cr /Applications/rezka-downloader.app
+```
+
+Replace the path with wherever you placed the `.app` bundle. After that, the app will open normally.
+
+**Linux:** make the binary executable if needed:
 
 ```bash
 chmod +x /path/to/rezka-downloader
