@@ -294,6 +294,8 @@ async fn download_file(
     let client = reqwest::Client::builder()
         .default_headers(headers)
         .redirect(reqwest::redirect::Policy::limited(10))
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .timeout(std::time::Duration::from_secs(300))
         .build()
         .map_err(|e| e.to_string())?;
 
@@ -360,6 +362,62 @@ async fn download_file(
     }
 }
 
+const MAX_RETRIES: u32 = 10;
+const INITIAL_BACKOFF_MS: u64 = 1000;
+const MAX_BACKOFF_MS: u64 = 30000;
+
+fn is_transient_error(status: u16) -> bool {
+    matches!(status, 429 | 500 | 502 | 503 | 504)
+}
+
+async fn send_with_retry(
+    client: &reqwest::Client,
+    url: &str,
+    range_header: Option<String>,
+    cancel: &AtomicBool,
+) -> Result<reqwest::Response, String> {
+    let mut last_err = String::new();
+    for attempt in 0..MAX_RETRIES {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("Cancelled".to_string());
+        }
+
+        let mut req = client.get(url);
+        if let Some(ref range) = range_header {
+            req = req.header("Range", range.as_str());
+        }
+
+        match req.send().await {
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                if is_transient_error(status) {
+                    last_err = format!("HTTP {}", status);
+                    let backoff = std::cmp::min(
+                        INITIAL_BACKOFF_MS * 2u64.pow(attempt),
+                        MAX_BACKOFF_MS,
+                    );
+                    tokio::time::sleep(tokio::time::Duration::from_millis(backoff)).await;
+                    continue;
+                }
+                return Ok(resp);
+            }
+            Err(e) => {
+                if e.is_connect() || e.is_timeout() {
+                    last_err = e.to_string();
+                    let backoff = std::cmp::min(
+                        INITIAL_BACKOFF_MS * 2u64.pow(attempt),
+                        MAX_BACKOFF_MS,
+                    );
+                    tokio::time::sleep(tokio::time::Duration::from_millis(backoff)).await;
+                    continue;
+                }
+                return Err(e.to_string());
+            }
+        }
+    }
+    Err(format!("{} (after {} retries)", last_err, MAX_RETRIES))
+}
+
 async fn download_single(
     client: &reqwest::Client,
     url: &str,
@@ -368,7 +426,12 @@ async fn download_single(
     total: Arc<AtomicU64>,
     cancel: Arc<AtomicBool>,
 ) -> Result<(), String> {
-    let mut response = client.get(url).send().await.map_err(|e| e.to_string())?;
+    let mut response = send_with_retry(client, url, None, &cancel).await?;
+
+    let status = response.status().as_u16();
+    if status != 200 && status != 206 {
+        return Err(format!("HTTP {}", status));
+    }
 
     // Try to get content-length from the GET response if not already set
     if total.load(Ordering::Relaxed) == 0 {
@@ -489,12 +552,8 @@ async fn download_chunk(
     downloaded: Arc<AtomicU64>,
     cancel: Arc<AtomicBool>,
 ) -> Result<(), String> {
-    let mut response = client
-        .get(url)
-        .header("Range", format!("bytes={}-{}", start, end))
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
+    let range = format!("bytes={}-{}", start, end);
+    let mut response = send_with_retry(client, url, Some(range), &cancel).await?;
 
     let status = response.status().as_u16();
     if status != 200 && status != 206 {
