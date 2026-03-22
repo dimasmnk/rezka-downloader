@@ -1,9 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter};
-use tokio::io::{AsyncWriteExt, BufWriter};
+use tokio::io::{AsyncSeekExt, AsyncWriteExt, BufWriter};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -295,7 +295,8 @@ async fn download_file(
         .default_headers(headers)
         .redirect(reqwest::redirect::Policy::limited(10))
         .connect_timeout(std::time::Duration::from_secs(30))
-        .timeout(std::time::Duration::from_secs(300))
+        .read_timeout(std::time::Duration::from_secs(60))
+        .tcp_nodelay(true)
         .build()
         .map_err(|e| e.to_string())?;
 
@@ -362,6 +363,7 @@ async fn download_file(
     }
 }
 
+const SEGMENT_SIZE: u64 = 4 * 1024 * 1024; // 4MB segments for dynamic chunking
 const MAX_RETRIES: u32 = 10;
 const INITIAL_BACKOFF_MS: u64 = 1000;
 const MAX_BACKOFF_MS: u64 = 30000;
@@ -475,29 +477,70 @@ async fn download_multi(
     downloaded: Arc<AtomicU64>,
     cancel: Arc<AtomicBool>,
 ) -> Result<(), String> {
-    let chunk_size = total_size / thread_count as u64;
+    // Dynamic segmenting: many small segments distributed across workers.
+    // This keeps all workers busy and avoids per-connection throttling by CDNs.
+    let segment_count = ((total_size + SEGMENT_SIZE - 1) / SEGMENT_SIZE) as usize;
+    let next_segment = Arc::new(AtomicUsize::new(0));
+
+    // Pre-allocate output file to total size
+    let file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)
+        .await
+        .map_err(|e| e.to_string())?;
+    file.set_len(total_size).await.map_err(|e| e.to_string())?;
+    let file = Arc::new(tokio::sync::Mutex::new(file));
+
     let mut handles = Vec::new();
-
-    for i in 0..thread_count {
-        let start = i as u64 * chunk_size;
-        let end = if i == thread_count - 1 {
-            total_size - 1
-        } else {
-            start + chunk_size - 1
-        };
-
-        let chunk_path = path.with_extension(format!("part{}", i));
+    for _ in 0..thread_count {
         let client = client.clone();
         let url = url.to_string();
         let downloaded = downloaded.clone();
         let cancel = cancel.clone();
+        let next_segment = next_segment.clone();
+        let file = file.clone();
+        let total = total_size;
+        let seg_count = segment_count;
 
         handles.push(tokio::spawn(async move {
-            download_chunk(&client, &url, &chunk_path, start, end, downloaded, cancel).await
+            loop {
+                let seg_idx = next_segment.fetch_add(1, Ordering::SeqCst);
+                if seg_idx >= seg_count {
+                    return Ok::<(), String>(());
+                }
+                let start = seg_idx as u64 * SEGMENT_SIZE;
+                let end = std::cmp::min(start + SEGMENT_SIZE - 1, total - 1);
+
+                // Retry individual segments on failure
+                let mut segment_retries = 0u32;
+                loop {
+                    match download_segment(&client, &url, &file, start, end, &downloaded, &cancel).await {
+                        Ok(()) => break,
+                        Err(_) if cancel.load(Ordering::Relaxed) => {
+                            return Err("Cancelled".to_string());
+                        }
+                        Err(e) => {
+                            segment_retries += 1;
+                            if segment_retries >= 5 {
+                                return Err(e);
+                            }
+                            // The segment will overwrite the same file region on retry,
+                            // so the file stays correct despite partial progress.
+                            let backoff = std::cmp::min(
+                                INITIAL_BACKOFF_MS * 2u64.pow(segment_retries - 1),
+                                MAX_BACKOFF_MS,
+                            );
+                            tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
+                        }
+                    }
+                }
+            }
         }));
     }
 
-    // Wait for all chunks
+    // Wait for all workers
     let mut errors = Vec::new();
     for handle in handles {
         match handle.await {
@@ -508,74 +551,76 @@ async fn download_multi(
     }
 
     if cancel.load(Ordering::Relaxed) {
-        for i in 0..thread_count {
-            let chunk_path = path.with_extension(format!("part{}", i));
-            let _ = tokio::fs::remove_file(&chunk_path).await;
-        }
+        let _ = tokio::fs::remove_file(path).await;
         return Err("Cancelled".to_string());
     }
 
     if !errors.is_empty() {
-        for i in 0..thread_count {
-            let chunk_path = path.with_extension(format!("part{}", i));
-            let _ = tokio::fs::remove_file(&chunk_path).await;
-        }
+        let _ = tokio::fs::remove_file(path).await;
         return Err(errors.join("; "));
     }
 
-    // Concatenate chunks into final file
-    let mut output = tokio::fs::File::create(path)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    for i in 0..thread_count {
-        let chunk_path = path.with_extension(format!("part{}", i));
-        let mut chunk_file = tokio::fs::File::open(&chunk_path)
-            .await
-            .map_err(|e| e.to_string())?;
-        tokio::io::copy(&mut chunk_file, &mut output)
-            .await
-            .map_err(|e| e.to_string())?;
-        let _ = tokio::fs::remove_file(&chunk_path).await;
+    // Ensure all data is flushed
+    {
+        let mut f = file.lock().await;
+        f.flush().await.map_err(|e| e.to_string())?;
     }
 
-    output.flush().await.map_err(|e| e.to_string())?;
     Ok(())
 }
 
-async fn download_chunk(
+async fn download_segment(
     client: &reqwest::Client,
     url: &str,
-    path: &Path,
+    file: &tokio::sync::Mutex<tokio::fs::File>,
     start: u64,
     end: u64,
-    downloaded: Arc<AtomicU64>,
-    cancel: Arc<AtomicBool>,
+    downloaded: &AtomicU64,
+    cancel: &AtomicBool,
 ) -> Result<(), String> {
     let range = format!("bytes={}-{}", start, end);
-    let mut response = send_with_retry(client, url, Some(range), &cancel).await?;
+    let mut response = send_with_retry(client, url, Some(range), cancel).await?;
 
     let status = response.status().as_u16();
     if status != 200 && status != 206 {
         return Err(format!("HTTP {}", status));
     }
 
-    let file = tokio::fs::File::create(path)
-        .await
-        .map_err(|e| e.to_string())?;
-    let mut writer = BufWriter::with_capacity(256 * 1024, file);
+    let mut buffer = Vec::with_capacity(512 * 1024);
+    let mut offset = start;
 
     while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
         if cancel.load(Ordering::Relaxed) {
             return Err("Cancelled".to_string());
         }
-        writer.write_all(&chunk)
-            .await
-            .map_err(|e| e.to_string())?;
+        buffer.extend_from_slice(&chunk);
         downloaded.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+
+        // Flush buffer to file when large enough to reduce lock contention
+        if buffer.len() >= 512 * 1024 {
+            let mut f = file.lock().await;
+            f.seek(std::io::SeekFrom::Start(offset))
+                .await
+                .map_err(|e| e.to_string())?;
+            f.write_all(&buffer)
+                .await
+                .map_err(|e| e.to_string())?;
+            offset += buffer.len() as u64;
+            buffer.clear();
+        }
     }
 
-    writer.flush().await.map_err(|e| e.to_string())?;
+    // Flush remaining data
+    if !buffer.is_empty() {
+        let mut f = file.lock().await;
+        f.seek(std::io::SeekFrom::Start(offset))
+            .await
+            .map_err(|e| e.to_string())?;
+        f.write_all(&buffer)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+
     Ok(())
 }
 
